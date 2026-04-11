@@ -1,0 +1,56 @@
+# Запуск: из корня репозитория
+#   docker compose up --build
+# UI: http://localhost:8080  |  API: http://localhost:8000  |  Swagger: http://localhost:8000/docs
+#
+# Сеть и DNS: все сервисы в одной сети Compose — бэкенд ходит в БД по имени postgres:5432.
+# Пароль Postgres задаётся ниже (или переопределите POSTGRES_PASSWORD в файле .env рядом с compose).
+#
+# Другой URL API при сборке фронта (редко нужно):
+#   docker compose build --build-arg VITE_API_BASE_URL=https://example.com frontend
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: nuclear
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nuclear_local_dev}
+      POSTGRES_DB: nuclear_support
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nuclear -d nuclear_support"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://nuclear:${POSTGRES_PASSWORD:-nuclear_local_dev}@postgres:5432/nuclear_support
+      CORS_ORIGINS: "http://localhost:8080,http://127.0.0.1:8080,http://localhost,http://127.0.0.1,http://localhost:5173,http://127.0.0.1:5173"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 8
+      start_period: 40s
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: http://localhost:8000
+    ports:
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

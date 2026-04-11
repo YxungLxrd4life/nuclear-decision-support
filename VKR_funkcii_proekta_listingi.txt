@@ -1,0 +1,363 @@
+ДОПОЛНИТЕЛЬНЫЕ ФУНКЦИИ ПРОТОТИПА СППР С ЛИСТИНГАМИ КОДА
+(создание и редактирование сценариев, JSON и без полного графа в теле запроса)
+
+================================================================================
+1. СОЗДАНИЕ СЦЕНАРИЯ БЕЗ УЗЛОВ (ТОЛЬКО ИМЯ И ОПИСАНИЕ)
+================================================================================
+
+Назначение. Эндпоинт POST /scenarios создаёт запись сценария в БД без узлов и рёбер.
+У такого сценария root_node_id остаётся NULL; запуск сессии (POST /sessions/start) для него
+невозможен, пока граф не будет создан иным способом (в прототипе основной путь —
+POST /scenarios/with-nodes или загрузка встроенных JSON).
+
+Функция в API (main.py):
+
+@app.post("/scenarios", response_model=schemas.Scenario)
+def create_scenario(
+    scenario_in: schemas.ScenarioCreate,
+    db: Session = Depends(get_db),
+    current_admin: models.User = Depends(auth.get_current_admin),
+):
+    try:
+        return crud.create_scenario(db, scenario_in)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+Прикладная логика (crud.py):
+
+def create_scenario(db: Session, scenario_in: schemas.ScenarioCreate) -> models.Scenario:
+    existing = db.query(models.Scenario).filter(
+        models.Scenario.name == scenario_in.name
+    ).first()
+    if existing is not None:
+        raise ValueError("Сценарий с таким названием уже существует")
+
+    scenario = models.Scenario(
+        name=scenario_in.name,
+        description=scenario_in.description,
+    )
+    db.add(scenario)
+    db.commit()
+    db.refresh(scenario)
+    return scenario
+
+Схема тела запроса (schemas.py) — два строковых поля:
+
+class ScenarioCreate(ScenarioBase):
+    pass
+
+class ScenarioBase(BaseModel):
+    name: str
+    description: str
+
+Пример JSON для Swagger / REST:
+
+{"name": "Тестовый сценарий", "description": "Только карточка, без дерева"}
+
+Клиент. В services/api.ts объявлена функция createScenario (POST /scenarios), но панель
+администратора в текущей версии для создания использует только createScenarioWithNodes;
+«пустой» сценарий удобно создавать через Swagger или отдельный вызов API.
+
+
+================================================================================
+2. СОЗДАНИЕ СЦЕНАРИЯ С ГРАФОМ (ОДИН JSON: УЗЛЫ И СВЯЗИ ПО КЛЮЧАМ)
+================================================================================
+
+Назначение. POST /scenarios/with-nodes принимает структуру ScenarioWithNodesCreate:
+имя, описание, root_node_key и список nodes с временными ключами key и переходами
+next_node_key. Сервер создаёт записи Node и Answer, подставляя числовые next_node_id.
+
+Маршрут (main.py):
+
+@app.post("/scenarios/with-nodes", response_model=schemas.Scenario)
+def create_scenario_with_nodes(
+    scenario_in: schemas.ScenarioWithNodesCreate,
+    db: Session = Depends(get_db),
+    current_admin: models.User = Depends(auth.get_current_admin),
+):
+    try:
+        return crud.create_scenario_with_nodes(db, scenario_in)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+Фрагмент ядра логики (crud.py) — сопоставление ключей и создание ответов:
+
+def create_scenario_with_nodes(
+    db: Session, scenario_in: schemas.ScenarioWithNodesCreate
+) -> models.Scenario:
+    ...
+    key_to_node: dict[str, models.Node] = {}
+    for node_in in scenario_in.nodes:
+        node = models.Node(
+            scenario_id=scenario.id,
+            question=node_in.question,
+            is_final=node_in.is_final,
+            final_action=node_in.final_action,
+        )
+        db.add(node)
+        db.flush()
+        key_to_node[node_in.key] = node
+
+    root_node = key_to_node.get(scenario_in.root_node_key)
+    if root_node is None:
+        raise ValueError("Root node key not found in nodes list")
+    scenario.root_node_id = root_node.id
+    ...
+
+    for node_in in scenario_in.nodes:
+        current_node = key_to_node[node_in.key]
+        for answer_in in node_in.answers:
+            next_node_id = None
+            if answer_in.next_node_key:
+                next_node = key_to_node.get(answer_in.next_node_key)
+                if next_node is None:
+                    raise ValueError(
+                        f"Next node key '{answer_in.next_node_key}' not found"
+                    )
+                next_node_id = next_node.id
+            db.add(
+                models.Answer(
+                    node_id=current_node.id,
+                    text=answer_in.text,
+                    next_node_id=next_node_id,
+                )
+            )
+
+    db.commit()
+    db.refresh(scenario)
+    return scenario
+
+Пример минимального JSON тела (для Swagger), согласованного со схемой:
+
+{
+  "name": "Демо-регламент",
+  "description": "Два шага",
+  "root_node_key": "start",
+  "nodes": [
+    {
+      "key": "start",
+      "question": "Условие выполнено?",
+      "is_final": false,
+      "answers": [
+        {"text": "Да", "next_node_key": "end"},
+        {"text": "Нет", "next_node_key": "end"}
+      ]
+    },
+    {
+      "key": "end",
+      "question": "Действие",
+      "is_final": true,
+      "final_action": "Зафиксировать параметры",
+      "answers": []
+    }
+  ]
+}
+
+
+================================================================================
+3. РЕДАКТИРОВАНИЕ СЦЕНАРИЯ (ТОЛЬКО НАЗВАНИЕ И ОПИСАНИЕ, БЕЗ ИЗМЕНЕНИЯ ГРАФА)
+================================================================================
+
+Назначение. PUT /scenarios/{scenario_id} обновляет поля name и description.
+Топология графа (узлы и ответы) этим методом не меняется — в прототипе нет отдельного
+API «перестроить дерево» для существующего id.
+
+Маршрут (main.py):
+
+@app.put("/scenarios/{scenario_id}", response_model=schemas.Scenario)
+def update_scenario(
+    scenario_id: int,
+    scenario_in: schemas.ScenarioCreate,
+    db: Session = Depends(get_db),
+    current_admin: models.User = Depends(auth.get_current_admin),
+):
+    scenario = crud.update_scenario(db, scenario_id, scenario_in)
+    if not scenario:
+        raise HTTPException(status_code=404, detail="Scenario not found")
+    return scenario
+
+Реализация (crud.py):
+
+def update_scenario(db: Session, scenario_id: int, scenario_in: schemas.ScenarioCreate) -> models.Scenario | None:
+    scenario = get_scenario(db, scenario_id)
+    if scenario is None:
+        return None
+    scenario.name = scenario_in.name
+    scenario.description = scenario_in.description
+    db.commit()
+    db.refresh(scenario)
+    return scenario
+
+Клиент: страница EditScenarioPage загружает сценарий и сохраняет только имя и описание
+(api.ts — updateScenario):
+
+export const updateScenario = async (
+  scenarioId: number,
+  scenario: Omit<Scenario, 'id' | 'root_node_id'>
+): Promise<Scenario> => {
+  const { data } = await api.put(`/scenarios/${scenarioId}`, {
+    name: scenario.name,
+    description: scenario.description
+  })
+  return data
+}
+
+
+================================================================================
+4. УДАЛЕНИЕ СЦЕНАРИЯ
+================================================================================
+
+Маршрут (main.py):
+
+@app.delete("/scenarios/{scenario_id}")
+def delete_scenario(
+    scenario_id: int,
+    db: Session = Depends(get_db),
+    current_admin: models.User = Depends(auth.get_current_admin),
+):
+    ok = crud.delete_scenario(db, scenario_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Scenario not found")
+    return {"detail": "Deleted"}
+
+Логика (crud.py) — каскадное удаление связанных сущностей задаётся в моделях SQLAlchemy
+(узлы сценария и т.д.):
+
+def delete_scenario(db: Session, scenario_id: int) -> bool:
+    scenario = get_scenario(db, scenario_id)
+    if scenario is None:
+        return False
+    db.delete(scenario)
+    db.commit()
+    return True
+
+
+================================================================================
+5. ДВА РЕЖИМА СОЗДАНИЯ В АДМИН-ПАНЕЛИ: КОНСТРУКТОР И ВСТАВКА JSON
+================================================================================
+
+Назначение. В AdminPanel режим createMode: «basic» — сборка узлов в форме; «json» —
+парсинг JSON с полями root_node_key и nodes; name и description всегда берутся из полей
+формы и подмешиваются в запрос.
+
+Фрагмент обработчика (AdminPanel.tsx):
+
+const handleCreate = async (e: React.FormEvent) => {
+  e.preventDefault()
+  setError(null)
+  if (!name.trim()) return
+  try {
+    let created: Scenario
+    if (createMode === 'json') {
+      const payload = JSON.parse(scenarioJson) as Omit<ScenarioWithNodesCreate, 'name' | 'description'>
+      created = await createScenarioWithNodes({
+        name,
+        description,
+        root_node_key: payload.root_node_key,
+        nodes: payload.nodes
+      })
+    } else {
+      ...
+      created = await createScenarioWithNodes({
+        name,
+        description,
+        root_node_key: rootNodeKey,
+        nodes: nodesPayload
+      })
+    }
+    ...
+  } catch ...
+}
+
+В режиме «json» в текстовое поле вставляется фрагмент без name/description, например:
+
+{
+  "root_node_key": "start",
+  "nodes": [ ... ]
+}
+
+HTTP-вызов в обоих случаях один: POST /scenarios/with-nodes (api.ts):
+
+export const createScenarioWithNodes = async (
+  scenario: ScenarioWithNodesCreate
+): Promise<Scenario> => {
+  const { data } = await api.post('/scenarios/with-nodes', scenario)
+  return data
+}
+
+
+================================================================================
+6. ЗАГРУЗКА ВСТРОЕННЫХ СЦЕНАРИЕВ ИЗ ФАЙЛОВ JSON ПРИ СТАРТЕ И ПРИ GET /scenarios
+================================================================================
+
+Назначение. Модуль bundled_scenarios читает JSON из пакета app/data (например
+scenario_ie46_kva.json), валидирует через ScenarioWithNodesCreate и идемпотентно
+создаёт сценарий, если записи с таким именем ещё нет.
+
+Фрагмент (bundled_scenarios.py):
+
+def ensure_bundled_scenarios(db: Session) -> None:
+    """Если сценария с таким именем ещё нет — создать из JSON."""
+    for filename in _BUNDLED_SCENARIO_FILES:
+        raw = _read_bundled_file(filename)
+        ...
+        data = json.loads(raw)
+        name = data.get("name")
+        ...
+        scenario_in = schemas.ScenarioWithNodesCreate(**data)
+        crud.ensure_scenario_with_nodes(db, scenario_in)
+
+Вызов из get_scenarios (main.py) гарантирует появление встроенных регламентов в БД даже
+при смене рабочего каталога процесса.
+
+
+================================================================================
+7. ЖУРНАЛ ДЕЙСТВИЙ ОПЕРАТОРА
+================================================================================
+
+Назначение. При входе, старте сессии и выборе ответа для не-админа пишется запись
+OperatorActionLog; администратор может получить ленту GET /admin/operator-logs.
+
+Создание записи (crud.py):
+
+def create_operator_action_log(
+    db: Session,
+    operator_username: str,
+    action_type: str,
+    scenario_id: int | None = None,
+    session_id: int | None = None,
+    node_id: int | None = None,
+    answer_id: int | None = None,
+    details: str | None = None,
+) -> models.OperatorActionLog:
+    log = models.OperatorActionLog(...)
+    db.add(log)
+    db.commit()
+    db.refresh(log)
+    return log
+
+Вызовы из main.py привязаны к login, start_session и answer_session (см. исходный файл).
+
+
+================================================================================
+8. ДИАГНОСТИКА: HEALTH БЕЗ БД И С ПРОВЕРКОЙ БД
+================================================================================
+
+GET /health — ответ 200 без обращения к СУБД (проверка, что uvicorn жив).
+
+GET /health/db — вызов ensure_bundled_scenarios, подсчёт сценариев; при ошибке БД — 500.
+
+Код см. main.py, функции health и health_db.
+
+
+================================================================================
+КРАТКАЯ СВОДКА ПО СЦЕНАРИЯМ
+================================================================================
+
+  POST /scenarios              — только name, description (графа нет).
+  POST /scenarios/with-nodes   — полный граф в одном JSON (ключи узлов → id в БД).
+  PUT  /scenarios/{id}         — смена name/description, граф не трогается.
+  DELETE /scenarios/{id}       — удаление сценария.
+  Встроенные JSON              — тот же формат, что и for with-nodes, плюс поле name в файле.
+  Админка                      — визуальный конструктор или вставка JSON → всегда with-nodes.
+  Редактирование в UI          — страница EditScenarioPage → только PUT метаданных.

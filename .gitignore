@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+backend/venv/
+backend/.venv/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Env and local secrets
+.env
+backend/.env
+*.local
+
+# SQLite / local DB
+*.db
+backend/nuclear_support.db
+
+# Node
+frontend/node_modules/
+frontend/dist/
+npm-debug.log*
+yarn-error.log*
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini
+
+# Logs and debug
+*.log
+backend/debug-*.log
+
+# Cursor / agent (optional local)
+.cursor/

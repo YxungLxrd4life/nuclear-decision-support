@@ -1,0 +1,404 @@
+ДОПОЛНЕНИЕ К РАЗДЕЛУ 3 (ТЕХНОЛОГИЧЕСКАЯ РЕАЛИЗАЦИЯ)
+По структуре и оформлению: методические указания по технологической практике (образец отчёта РТУ МИРЭА): листинги с заголовками «Листинг 3.X – …», пояснения к листингам, подписи к рисункам «Рисунок 3.X – … [разработано автором]».
+
+────────────────────────────────────────────────────────────────────────────────
+3.7 Создание сценария без описания графа в запросе
+────────────────────────────────────────────────────────────────────────────────
+
+Для регистрации «пустой» карточки сценария (только наименование и описание) используется эндпоинт POST /scenarios. Тело запроса валидируется схемой ScenarioCreate; корневой узел в базе не создаётся, поле root_node_id остаётся незаполненным до последующего создания графа иным способом. Доступ ограничен ролью администратора через зависимость get_current_admin.
+
+Листинг 3.7 – Объявление маршрута создания сценария без узлов (файл main.py)
+
+@app.post("/scenarios", response_model=schemas.Scenario)
+def create_scenario(
+    scenario_in: schemas.ScenarioCreate,
+    db: Session = Depends(get_db),
+    current_admin: models.User = Depends(auth.get_current_admin),
+):
+    try:
+        return crud.create_scenario(db, scenario_in)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+Пояснение к листингу 3.7. Обработчик принимает JSON с полями name и description, передаёт их в слой CRUD и при нарушении уникальности имени возвращает код 400 с текстом ошибки. Успешный ответ сериализуется в модель Scenario с присвоенным идентификатором записи.
+
+Листинг 3.8 – Реализация записи сценария в персистентное хранилище (файл crud.py)
+
+def create_scenario(db: Session, scenario_in: schemas.ScenarioCreate) -> models.Scenario:
+    existing = db.query(models.Scenario).filter(
+        models.Scenario.name == scenario_in.name
+    ).first()
+    if existing is not None:
+        raise ValueError("Сценарий с таким названием уже существует")
+
+    scenario = models.Scenario(
+        name=scenario_in.name,
+        description=scenario_in.description,
+    )
+    db.add(scenario)
+    db.commit()
+    db.refresh(scenario)
+    return scenario
+
+Пояснение к листингу 3.8. Выполняется проверка отсутствия дубликата по имени, создаётся объект ORM, фиксируется транзакция и возвращается актуальное состояние строки для ответа API.
+
+
+────────────────────────────────────────────────────────────────────────────────
+3.8 Создание сценария с графом регламента в одном JSON-запросе
+────────────────────────────────────────────────────────────────────────────────
+
+Полное описание дерева решений передаётся структурой ScenarioWithNodesCreate: список узлов с временными строковыми ключами и ссылками next_node_key на следующий узел. Сервер преобразует ключи в числовые идентификаторы записей Node и Answer в базе данных.
+
+Листинг 3.9 – Маршрут создания сценария с узлами и ответами (файл main.py)
+
+@app.post("/scenarios/with-nodes", response_model=schemas.Scenario)
+def create_scenario_with_nodes(
+    scenario_in: schemas.ScenarioWithNodesCreate,
+    db: Session = Depends(get_db),
+    current_admin: models.User = Depends(auth.get_current_admin),
+):
+    try:
+        return crud.create_scenario_with_nodes(db, scenario_in)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+Пояснение к листингу 3.9. Маршрут делегирует разбор графа функции create_scenario_with_nodes; ошибки целостности (неизвестный корень, битая ссылка на узел) преобразуются в ответ 400.
+
+Листинг 3.10 – Сопоставление ключей узлов и создание ответов (фрагмент crud.py)
+
+    key_to_node: dict[str, models.Node] = {}
+    for node_in in scenario_in.nodes:
+        node = models.Node(
+            scenario_id=scenario.id,
+            question=node_in.question,
+            is_final=node_in.is_final,
+            final_action=node_in.final_action,
+        )
+        db.add(node)
+        db.flush()
+        key_to_node[node_in.key] = node
+
+    root_node = key_to_node.get(scenario_in.root_node_key)
+    if root_node is None:
+        raise ValueError("Root node key not found in nodes list")
+    scenario.root_node_id = root_node.id
+    db.flush()
+
+    for node_in in scenario_in.nodes:
+        current_node = key_to_node[node_in.key]
+        for answer_in in node_in.answers:
+            next_node_id = None
+            if answer_in.next_node_key:
+                next_node = key_to_node.get(answer_in.next_node_key)
+                if next_node is None:
+                    raise ValueError(
+                        f"Next node key '{answer_in.next_node_key}' not found"
+                    )
+                next_node_id = next_node.id
+            db.add(
+                models.Answer(
+                    node_id=current_node.id,
+                    text=answer_in.text,
+                    next_node_id=next_node_id,
+                )
+            )
+
+Пояснение к листингу 3.10. Двухпроходная схема: сначала создаются все узлы и словарь key_to_node, затем для сценария задаётся root_node_id, после чего для каждого ответа вычисляется next_node_id по ключу целевого узла и записывается связь в таблице answers.
+
+
+────────────────────────────────────────────────────────────────────────────────
+3.9 Редактирование метаданных сценария без изменения топологии графа
+────────────────────────────────────────────────────────────────────────────────
+
+Изменение наименования и текстового описания существующего сценария выполняется методом PUT без затрагивания узлов и рёбер. Идентификатор сценария задаётся в пути URL.
+
+Листинг 3.11 – Маршрут обновления сценария (файл main.py)
+
+@app.put("/scenarios/{scenario_id}", response_model=schemas.Scenario)
+def update_scenario(
+    scenario_id: int,
+    scenario_in: schemas.ScenarioCreate,
+    db: Session = Depends(get_db),
+    current_admin: models.User = Depends(auth.get_current_admin),
+):
+    scenario = crud.update_scenario(db, scenario_id, scenario_in)
+    if not scenario:
+        raise HTTPException(status_code=404, detail="Scenario not found")
+    return scenario
+
+Пояснение к листингу 3.11. При отсутствии записи с указанным идентификатором клиент получает 404; при успехе возвращается обновлённый объект Scenario.
+
+Листинг 3.12 – Обновление полей в базе данных (файл crud.py)
+
+def update_scenario(db: Session, scenario_id: int, scenario_in: schemas.ScenarioCreate) -> models.Scenario | None:
+    scenario = get_scenario(db, scenario_id)
+    if scenario is None:
+        return None
+    scenario.name = scenario_in.name
+    scenario.description = scenario_in.description
+    db.commit()
+    db.refresh(scenario)
+    return scenario
+
+Пояснение к листингу 3.12. Изменяются только атрибуты name и description ORM-объекта; топология графа остаётся неизменной, что соответствует ограничениям программного прототипа.
+
+
+────────────────────────────────────────────────────────────────────────────────
+3.10 Удаление сценария и идемпотентная загрузка встроенных JSON
+────────────────────────────────────────────────────────────────────────────────
+
+Листинг 3.13 – Удаление сценария администратором (файл main.py)
+
+@app.delete("/scenarios/{scenario_id}")
+def delete_scenario(
+    scenario_id: int,
+    db: Session = Depends(get_db),
+    current_admin: models.User = Depends(auth.get_current_admin),
+):
+    ok = crud.delete_scenario(db, scenario_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Scenario not found")
+    return {"detail": "Deleted"}
+
+Пояснение к листингу 3.13. Операция удаления каскадно затрагивает связанные сущности согласно настройкам моделей SQLAlchemy; при отсутствии сценария возвращается 404.
+
+Листинг 3.14 – Загрузка регламента из файла пакета приложения (фрагмент bundled_scenarios.py)
+
+def ensure_bundled_scenarios(db: Session) -> None:
+    """Если сценария с таким именем ещё нет — создать из JSON."""
+    for filename in _BUNDLED_SCENARIO_FILES:
+        raw = _read_bundled_file(filename)
+        ...
+        data = json.loads(raw)
+        name = data.get("name")
+        ...
+        scenario_in = schemas.ScenarioWithNodesCreate(**data)
+        crud.ensure_scenario_with_nodes(db, scenario_in)
+
+Пояснение к листингу 3.14. JSON-файлы из каталога данных приложения преобразуются в ту же схему, что и тело POST /scenarios/with-nodes; функция ensure_scenario_with_nodes не создаёт дубликат по имени сценария, что обеспечивает идемпотентность при повторных вызовах при старте и при GET /scenarios.
+
+
+────────────────────────────────────────────────────────────────────────────────
+3.11 Журналирование действий оператора
+────────────────────────────────────────────────────────────────────────────────
+
+Листинг 3.15 – Запись события в журнал (файл crud.py)
+
+def create_operator_action_log(
+    db: Session,
+    operator_username: str,
+    action_type: str,
+    scenario_id: int | None = None,
+    session_id: int | None = None,
+    node_id: int | None = None,
+    answer_id: int | None = None,
+    details: str | None = None,
+) -> models.OperatorActionLog:
+    log = models.OperatorActionLog(
+        operator_username=operator_username,
+        action_type=action_type,
+        scenario_id=scenario_id,
+        session_id=session_id,
+        node_id=node_id,
+        answer_id=answer_id,
+        details=details,
+    )
+    db.add(log)
+    db.commit()
+    db.refresh(log)
+    return log
+
+Пояснение к листингу 3.15. Унифицированная функция фиксирует тип действия (вход, старт сессии, выбор ответа) и контекстные идентификаторы для последующего аудита; вызовы размещены в обработчиках login, start_session и answer_session для учётных записей без признака администратора.
+
+Листинг 3.16 – Выдача журнала администратору (файл main.py)
+
+@app.get("/admin/operator-logs", response_model=list[schemas.OperatorActionLog])
+def get_operator_logs(
+    limit: int = 200,
+    db: Session = Depends(get_db),
+    current_admin: models.User = Depends(auth.get_current_admin),
+):
+    return crud.get_operator_action_logs(db, limit=limit)
+
+Пояснение к листингу 3.16. Ограничение limit предотвращает передачу чрезмерного объёма данных; доступ защищён цепочкой зависимостей до get_current_admin.
+
+
+────────────────────────────────────────────────────────────────────────────────
+3.12 Клиентский вызов API при создании сценария из формы и из JSON
+────────────────────────────────────────────────────────────────────────────────
+
+Листинг 3.17 – Формирование HTTP-запроса с полным графом (файл services/api.ts)
+
+export const createScenarioWithNodes = async (
+  scenario: ScenarioWithNodesCreate
+): Promise<Scenario> => {
+  const { data } = await api.post('/scenarios/with-nodes', scenario)
+  return data
+}
+
+Пояснение к листингу 3.17. Экземпляр Axios уже содержит базовый URL и перехватчик Authorization; тело запроса сериализуется в JSON автоматически.
+
+Листинг 3.18 – Ветвление режима создания в интерфейсе администратора (фрагмент AdminPanel.tsx)
+
+    if (createMode === 'json') {
+      const payload = JSON.parse(scenarioJson) as Omit<ScenarioWithNodesCreate, 'name' | 'description'>
+      created = await createScenarioWithNodes({
+        name,
+        description,
+        root_node_key: payload.root_node_key,
+        nodes: payload.nodes
+      })
+    } else {
+      ...
+      created = await createScenarioWithNodes({
+        name,
+        description,
+        root_node_key: rootNodeKey,
+        nodes: nodesPayload
+      })
+    }
+
+Пояснение к листингу 3.18. В режиме вставки JSON поля name и description задаются в форме, а структура графа извлекается из разобранной строки; в режиме конструктора массив узлов собирается из состояния React и проходит валидацию перед отправкой тем же эндпоинтом.
+
+
+================================================================================
+РАЗДЕЛ 3.В ВИЗУАЛИЗАЦИЯ ИНТЕРФЕЙСА ПОЛЬЗОВАТЕЛЯ
+(отдельные пункты для иллюстрирования отчёта скриншотами)
+================================================================================
+
+Ниже приведены пункты, которые рекомендуется сопроводить рисунками в отчёте по практике или ВКР. Подписи оформляются по образцу: «Рисунок 3.X – … [разработано автором]».
+
+────────────────────────────────────────────────────────────────────────────────
+3.В.1 Компоновка приложения и навигация между зонами ответственности
+────────────────────────────────────────────────────────────────────────────────
+
+Корневой компонент приложения оборачивает маршруты React Router в контейнер Material UI Box и отображает верхнюю панель AppBar с заголовком системы и кнопками перехода к страницам входа оператора и администратора. Защищённые маршруты /operator и /admin реализованы обёртками OperatorRoute и AdminRoute: при отсутствии JWT в хранилище Redux выполняется перенаправление на соответствующую страницу аутентификации. Таким образом, визуально выделяются два контура: рабочее место оператора (прохождение сценария) и контура администратора (управление сценариями и просмотр журнала).
+
+Листинг 3.19 – Объявление панели и маршрутов (файл App.tsx)
+
+      <AppBar position="static">
+        <Toolbar>
+          <Typography variant="h6" sx={{ flexGrow: 1 }}>
+            СППР для БЩУ АЭС
+          </Typography>
+          <Button color="inherit" component={Link} to="/login-operator">
+            Вход оператора
+          </Button>
+          <Button color="inherit" component={Link} to="/login-admin">
+            Вход администратора
+          </Button>
+        </Toolbar>
+      </AppBar>
+      <Routes>
+        <Route path="/login-operator" element={<OperatorLoginPage />} />
+        <Route path="/login-admin" element={<AdminLoginPage />} />
+        <Route
+          path="/operator"
+          element={
+            <OperatorRoute>
+              <ScenarioSelector />
+            </OperatorRoute>
+          }
+        />
+        ...
+
+Пояснение к листингу 3.19. Использование компонентов MUI AppBar, Toolbar, Typography и Button обеспечивает единый визуальный стиль и предсказуемое расположение элементов управления на всех экранах.
+
+Рисунок 3.6 – Главная область приложения с верхней панелью и переходами к входу оператора и администратора [разработано автором]
+
+
+────────────────────────────────────────────────────────────────────────────────
+3.В.2 Экраны аутентификации
+────────────────────────────────────────────────────────────────────────────────
+
+Страницы OperatorLoginPage и AdminLoginPage построены на компонентах Paper, TextField и Button: форма ввода имени пользователя и пароля, отправка данных на эндпоинт /auth/login с типом application/x-www-form-urlencoded, сохранение токена в Redux и localStorage. Визуально форма центрируется на светлом фоне, что соответствует требованиям читаемости при длительной работе.
+
+Рисунок 3.7 – Экран входа оператора [разработано автором]
+
+Рисунок 3.8 – Экран входа администратора [разработано автором]
+
+
+────────────────────────────────────────────────────────────────────────────────
+3.В.3 Визуализация рабочего места оператора: выбор сценария и прохождение узлов
+────────────────────────────────────────────────────────────────────────────────
+
+Компонент ScenarioSelector отображает список доступных сценариев и инициирует POST /sessions/start после выбора. Компонент DecisionTree визуализирует текущий узел графа: карточка Card с Chip, отражающим состояние («шаг сценария» или «финальное решение»), типографика вопроса variant h5, список кнопок для ответов, блок истории принятых решений и кнопка «Начать заново». Цвет Chip меняется в зависимости от признака is_final, что поддерживает быстрое распознавание завершения ветви регламента.
+
+Листинг 3.20 – Фрагмент визуализации узла и состояния (файл DecisionTree.tsx)
+
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 2 }}>
+          <Chip
+            label={currentNode.is_final ? 'ФИНАЛЬНОЕ РЕШЕНИЕ' : 'ШАГ СЦЕНАРИЯ'}
+            color={getStatusColor()}
+          />
+          <Button variant="outlined" onClick={restart}>
+            Начать заново
+          </Button>
+        </Box>
+
+        <Typography
+          variant="h5"
+          gutterBottom
+          sx={{ fontWeight: 600 }}
+        >
+          {currentNode.question}
+        </Typography>
+
+Пояснение к листингу 3.20. Сочетание Chip и Typography задаёт иерархию внимания: сначала статус шага, затем содержательный текст вопроса; кнопка сброса вынесена в одну линию со статусом для экономии вертикального пространства.
+
+Рисунок 3.9 – Экран выбора сценария оператором [разработано автором]
+
+Рисунок 3.10 – Карточка текущего узла с вариантами ответов [разработано автором]
+
+Рисунок 3.11 – Отображение финального узла и итогового действия [разработано автором]
+
+
+────────────────────────────────────────────────────────────────────────────────
+3.В.4 Визуализация административной панели: конструктор, JSON и журнал
+────────────────────────────────────────────────────────────────────────────────
+
+Компонент AdminPanel использует Tabs для переключения между режимом создания сценария визуальным конструктором и режимом вставки JSON, поля TextField для наименования и описания, элементы Select и Switch для настройки узлов и финальности, список сценариев с кнопками перехода к редактированию и удаления. Отдельная вкладка или секция отображает логи операторов (List/ListItemText), что визуально отделяет административный контроль от редактирования контента.
+
+Рисунок 3.12 – Панель администратора: список сценариев и форма создания [разработано автором]
+
+Рисунок 3.13 – Режим вставки сценария из JSON [разработано автором]
+
+Рисунок 3.14 – Фрагмент конструктора узлов и переходов [разработано автором]
+
+Рисунок 3.15 – Просмотр журнала действий операторов [разработано автором]
+
+
+────────────────────────────────────────────────────────────────────────────────
+3.В.5 Экран редактирования метаданных сценария
+────────────────────────────────────────────────────────────────────────────────
+
+Страница EditScenarioPage содержит форму с полями названия и описания сценария и кнопкой сохранения; данные загружаются GET /scenarios/{id} при монтировании. Визуально страница оформлена через Paper с ограничением maxWidth для комфортной ширины строки текста при редактировании описания.
+
+Рисунок 3.16 – Форма редактирования наименования и описания сценария [разработано автором]
+
+
+────────────────────────────────────────────────────────────────────────────────
+3.В.6 Связь визуализации с документацией API
+────────────────────────────────────────────────────────────────────────────────
+
+Интерактивная документация Swagger UI по адресу /docs дублирует контракты, используемые клиентом, и позволяет визуально сопоставить экранные действия с HTTP-методами. Рекомендуется включить в отчёт скриншот с раскрытыми операциями, соответствующими сценарию демонстрации (например POST /auth/login, GET /scenarios, POST /sessions/start).
+
+Рисунок 3.17 – Фрагмент Swagger UI с эндпоинтами прототипа СППР [разработано автором]
+
+
+────────────────────────────────────────────────────────────────────────────────
+КРАТКИЙ перечень рисунков раздела визуализации (для списка иллюстраций)
+────────────────────────────────────────────────────────────────────────────────
+
+Рисунок 3.6 – Общая компоновка с AppBar и навигацией
+Рисунок 3.7 – Вход оператора
+Рисунок 3.8 – Вход администратора
+Рисунок 3.9 – Выбор сценария
+Рисунок 3.10 – Узел с вариантами ответов
+Рисунок 3.11 – Финальный узел
+Рисунок 3.12 – Админ-панель и список сценариев
+Рисунок 3.13 – Режим JSON
+Рисунок 3.14 – Конструктор узлов
+Рисунок 3.15 – Журнал операторов
+Рисунок 3.16 – Редактирование сценария (метаданные)
+Рисунок 3.17 – Swagger UI
